@@ -1,5 +1,11 @@
 # Overlap Scoring for OF3 models
 
+### Create the conda env:
+```
+mamba env create -f environment.yaml 
+mamba activate mcs_scoring
+```
+
 ### Postprocess the OF3 results
 Extract ligands from the OF3 model cifs and ensure that the protonation is consistent witht he ground-truth structures in fragalysis.
 
@@ -13,3 +19,5 @@ Align OF3 models to a reference structure, and calcualte MCS+color overlap wiht 
 ```
 python3 util03_Py_fragment_rmsd_eval.py -r=ref_rec_A71EV2A-x0450a.pdb -fsdf=sample_fragalysis_data/fragment_ligands.sdf -of3_r=example_results/ -o=mcs-rmsd_score_output/
 ```
+
+Output scores can be viewed in `mcs-rmsd_score_output/tsv_frag_coverage.tsv`
