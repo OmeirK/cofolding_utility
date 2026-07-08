@@ -27,7 +27,8 @@ parser.add_argument('--fragment_sdf', '-fsdf', help='Path to an sdf with the sub
 parser.add_argument('--of3_results_dir', '-of3_r', help='Path to the directory containing OF3 predictions.')
 parser.add_argument('--outdir', '-o', help='Path to directory to store mcs_scoring_outputs (default = mcs-rmsd_score/', default='mcs-rmsd_score/')
 parser.add_argument('--tmpdir', '-tmp', help='Path to directory to store temporary files (default = tmpmols/', default='tmpmols/')
-parser.add_argument('--cpu_count', '-cpu', help='(Optional) Specify how many CPUs to use for parallelization. Default = None', default=None)
+parser.add_argument('--cpu_count', '-cpu', help='(Optional) Specify how many CPUs to use for parallelization. Leave blank to use all available CPUs', default=None)
+parser.add_argument('--max_mcs_rmsd', '-rmsd', help='(Optional) Specify a maximum RMSD cutoff for MCS coverage calculations, in Angstroms. (Dfeault = 1.0)', default=1.0, type=float)
 
 args = parser.parse_args()
 
@@ -145,8 +146,8 @@ def get_mcs_cov(frag_mols, all_mols, max_rmsd=1.0):
                 mcs_cov_data[m1_name][f1_name]['mcs_smarts'] = res.smartsString
 
     # Count the number of unique low-rmsd atoms in m1
-    #out_data = [f'mol_name\tlow_rmsd_mcs_coverage\tn_low_rmsd_mcs_atoms\tmol_size']
-    out_data = []
+    # Calculate MCS coverage scores, and save output metrics
+    mcs_score_data = {}
     for m1_name in mcs_cov_data:
         unique_m1_ats = []
         for f1_name in mcs_cov_data[m1_name]:
@@ -165,10 +166,13 @@ def get_mcs_cov(frag_mols, all_mols, max_rmsd=1.0):
             #print(f'\tf1 coverage: {len(unique_f1_ats)}/{mcs_cov_data[m1_name][f1_name]["f1_size"]}')
         #print(f'\t{m1_name} low-RMSD MCS coverage: {len(unique_m1_ats)}/{m1_size}')
         accurate_mcs_coverage = len(unique_m1_ats)/m1_size
-        out_data.append(f'{m1_name}\t{accurate_mcs_coverage}\t{len(unique_m1_ats)}\t{m1_size}')
-                
+
+        mcs_score_data[m1_name] = {'mcs_coverage': accurate_mcs_coverage,
+                                   'n_low_rmsd_mcs_atoms': len(unique_m1_ats),
+                                   'mol_size': m1_size
+                                  }
     
-    return mcs_cov_data, out_data
+    return mcs_cov_data, mcs_score_data
 
 # Compile data for fragment screenign results
 def collect_frag_structures(frag_paths):
@@ -232,7 +236,7 @@ def check_frag_alignment(m_cif, m_ligs, frag_ensemble, ref_rec_pdb, max_rmsd=3.0
     #print(rmsd, max_rmsd)
     if rmsd > max_rmsd: 
         print(f'\tFAILED Alignment for Model {m_cif} (RMSD = {rmsd})')
-        err_log.append(f'\tCONF_FAIL Alignment for Model {m_cif} (RMSD = {rmsd})')
+        err_log.append(f'\tRECEPTOR_ALIGN_FAIL {m_cif} (RMSD = {rmsd})')
         cmd.delete('mdl_rec')
         return valid_models, invalid_models, err_log
     
@@ -473,9 +477,51 @@ def extract_sdfs_from_cif(cif_file, out_path, fragalysis_dir=None):
 
     return lig_sdf_l
 
+# Get average iptm between a ligand and non-ligand chains
+def get_model_iptm(conf_json, lig_sdf_l):
+    with open(conf_json) as f:
+        conf_data = json.load(f)
+    
+    ch_to_sdf_map = {}
+    lig_chains = []
+    for lig in lig_sdf_l:
+        lig_inf = lig.split('_')[-1]
+        lig_ch = lig_inf.split('-')[2]
+        lig_chains.append(lig_ch)
+
+        ch_to_sdf_map[lig_ch] = os.path.basename(lig)
+
+    iptm_data = {}
+    for ch_pair in conf_data["chain_pair_iptm"]:
+        ch_pair_str = ch_pair[1:-1]
+        ch_pair_l1 = ch_pair_str.split(',')
+        
+        iptm = conf_data["chain_pair_iptm"][ch_pair]
+        
+        valid_ligs = []
+        for ch1 in ch_pair_l1:
+            ch = ch1.strip()
+            if ch in lig_chains:
+                valid_ligs.append(ch)
+
+        if len(valid_ligs) == 1:
+            lc = valid_ligs[0]
+            if lc not in iptm_data:
+                iptm_data[lc] = []
+
+            iptm_data[lc].append(iptm)
+
+    out_data = {}
+    for lc in iptm_data:
+        sdf_n = ch_to_sdf_map[lc]
+        out_data[sdf_n] = np.average(iptm_data[lc])
 
 
-#def main():
+    return out_data  
+
+
+
+
 def mp_func(mp_inp):
     #(case, fragment_ensemble, frag_mols, frag_pharm_pos_data
     case_name = mp_inp[0]
@@ -501,22 +547,30 @@ def mp_func(mp_inp):
             #print('\t', seed)
             for sample in range(1,6):
                 model_path = f'{args.of3_results_dir}/{case}/{seed}/{case}_{seed}_sample_{sample}_model.cif'
+                confidence_json = f'{args.of3_results_dir}/{case}/{seed}/{case}_{seed}_sample_{sample}_confidences_aggregated.json'
                 if os.path.exists(model_path):
                     #print(f'\t{model_path}')
                     model_ligs = extract_sdfs_from_cif(model_path, args.tmpdir, fragalysis_dir=None)
+                    
+                    iptm_data = get_model_iptm(confidence_json, model_ligs)
+
                     aligned_models, invalid_models, errs = check_frag_alignment(model_path, model_ligs, fragment_ensemble, args.ref_rec, tmpdir=args.tmpdir)
                     if len(errs) > 0:
                         for l in errs:
                             l += f' ({case} {seed})'
                             err_out.append(l)
-
+                    
+                    #print(f'Invalid:', invalid_models)
                     # Load and annotate aligned ligands models
                     aligned_mols = []
                     for msdf in aligned_models:
+                        ligid = os.path.basename(msdf).split('_')[-1]
+                        ligid = ligid.split('.')[0]
+
                         m_mol = Chem.MolFromMolFile(msdf)
                         mol_smi = Chem.MolToSmiles(m_mol)
                         m_mol.SetProp('path', msdf)
-                        m_mol.SetProp('_Name', f'{case}.{seed}.{sample}')
+                        m_mol.SetProp('_Name', f'{case}.{seed}.{sample}.{ligid}')
                         m_mol.SetProp('smi', mol_smi)
                         aligned_mols.append(m_mol)
 
@@ -524,21 +578,35 @@ def mp_func(mp_inp):
                     color_score_data = get_color_overlap(frag_pharm_pos_data, aligned_mols)
 
                     # Calculate MCS RMSD metrics for each aligned cofolded molecule
-                    mcs_cov_data, out_data = get_mcs_cov(frag_mols, aligned_mols)
+                    mcs_cov_data, mcs_score_data = get_mcs_cov(frag_mols, aligned_mols, max_rmsd=args.max_mcs_rmsd)
+                    #out_data.append(f'{m1_name}\t{accurate_mcs_coverage}\t{len(unique_m1_ats)}\t{m1_size}')
 
                     # Append color features to the output
                     outlines = []
-                    for l in out_data:
-                        m_name = l.split('\t')[0]
+                    for m_name in mcs_score_data:
+                        ligid = m_name.split('_')[-1]
+                        ligid = ligid.split('.')[0]
                         
-                        l += f'\t{color_score_data[m_name]["total"]}'
+                        mcs_coverage = mcs_score_data[m_name]["mcs_coverage"]
+                        color_overlap = color_score_data[m_name]["total"]
 
-                        outlines.append(l)
+                        mcs_color_avg = np.average([mcs_coverage, color_overlap])
+                        mcs_color_prod = mcs_coverage*color_overlap
+
+                        outstr = f'{case}\t{seed}\t{sample}\t{ligid}\t{iptm_data[m_name]}\t{mcs_coverage}\t{color_overlap}\t{mcs_color_avg}\t{mcs_color_prod}\t{mcs_score_data[m_name]["mol_size"]}'
+                        outlines.append(outstr)
+
+
+                    #for l in out_data:
+                        #m_name = l.split('\t')[0]
+                        #l += f'\t{color_score_data[m_name]["total"]}\t{iptm_data[m_name]}'
+                        #print(m_name, iptm_data[m_name])
+
+                        #outlines.append(l)
                     
                     all_mcs_cov_data[case][seed] = mcs_cov_data
 
 
-                    #all_out_data += out_data
                     all_out_data += outlines
                     
                     # Deleteligand sdf files
@@ -576,7 +644,9 @@ def main():
 
         mp_inps.append((case, fragment_ensemble, frag_pharm_pos_data))
 
-    all_out_data = [f'mol_name\tlow_rmsd_mcs_coverage\tn_low_rmsd_mcs_atoms\tmol_size\tcolor_overlap']
+    # target   seed  sample   lig_id   pair_iptm   mcs_overlap color_overlap   mcs_color_avg  mcs_color_prod mol_size
+    #all_out_data = [f'mol_name\tlow_rmsd_mcs_coverage\tn_low_rmsd_mcs_atoms\tmol_size\tcolor_overlap\tpair_iptm']
+    all_out_data = [f'target\tseed\tsample\tlig_id\tpair_iptm\tmcs_overlap\tcolor_overlap\tmcs_color_avg\tmcs_color_prod\tmol_size']
     all_mcs_cov_data = {}
     err_out_all = []
 
@@ -589,10 +659,6 @@ def main():
     else:
         with mp.Pool(int(args.cpu_count)) as pool: 
             combined_results = list(tqdm.tqdm(pool.imap(mp_func, mp_inps, chunksize=1)))
-
-    #with mp.Pool(int(args.cpu_count)) as pool:
-    #    #r = list(tqdm.tqdm(pool.imap(mp_func, case_l, chunksize=1)))
-    #    combined_results = pool.map(mp_func, mp_inps, chunksize=1)
         
         #print(combined_results[0][1])
         #print(combined_results[1][1])
@@ -605,13 +671,6 @@ def main():
         all_mcs_cov_data.update(combined_results[i][1])
         err_out_all += combined_results[i][2]
         
-        #print(out_data)
-        #print(f'Out Data: {len(out_data)}')
-
-        #all_out_data += out_data
-        #err_out_all += err_out
-        #all_mcs_cov_data.update(mcs_cov_data)
-    
     with open(f'{args.outdir}/tsv_frag_coverage.tsv', 'w') as fo:
         fo.write('\n'.join(all_out_data))
     
