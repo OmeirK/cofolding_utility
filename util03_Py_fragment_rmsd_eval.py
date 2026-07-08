@@ -13,7 +13,8 @@ import shutil
 import argparse
 import numpy as np
 import pandas as pd
-from pymol import cmd
+import multiprocessing as mp
+from pymol import cmd, stored
 from rdkit import Chem
 from rdkit import RDConfig
 from rdkit.Chem import rdFMCS, ChemicalFeatures
@@ -26,6 +27,7 @@ parser.add_argument('--fragment_sdf', '-fsdf', help='Path to an sdf with the sub
 parser.add_argument('--of3_results_dir', '-of3_r', help='Path to the directory containing OF3 predictions. NOTE: OF3 predictions should have ligands converted to .sdf format')
 parser.add_argument('--outdir', '-o', help='Path to directory to store mcs_scoring_outputs (default = mcs-rmsd_score/', default='mcs-rmsd_score/')
 parser.add_argument('--tmpdir', '-tmp', help='Path to directory to store temporary files (default = tmpmols/', default='tmpmols/')
+parser.add_argument('--cpu_count', '-cpu', help='(Optional) Specify how many CPUs to use for parallelization. Default = None', default=None)
 
 args = parser.parse_args()
 
@@ -161,7 +163,7 @@ def get_mcs_cov(frag_mols, all_mols, max_rmsd=1.0):
 
             #print(m1_name, f1_name)
             #print(f'\tf1 coverage: {len(unique_f1_ats)}/{mcs_cov_data[m1_name][f1_name]["f1_size"]}')
-        print(f'\t{m1_name} low-RMSD MCS coverage: {len(unique_m1_ats)}/{m1_size}')
+        #print(f'\t{m1_name} low-RMSD MCS coverage: {len(unique_m1_ats)}/{m1_size}')
         accurate_mcs_coverage = len(unique_m1_ats)/m1_size
         out_data.append(f'{m1_name}\t{accurate_mcs_coverage}\t{len(unique_m1_ats)}\t{m1_size}')
                 
@@ -204,40 +206,11 @@ def collect_frag_structures(frag_paths):
 
     return frag_data, frag_mols
 
-# Store structure information for models generated with OF3
-def read_of3_structures(of3_dir):
-    of3_data = {}
-    
-    of3_dir = os.path.abspath(of3_dir)
-    case_results = glob.glob(f'{of3_dir}/*/')
-
-    for cr in case_results: 
-        case_n = cr.split('/')[-2]
-        #print(case_n, cr)
-
-        if case_n not in of3_data:
-            of3_data[case_n] = {}
-
-        seeds = os.listdir(f'{cr}/')
-
-        for s in seeds:
-            if s not in of3_data[case_n]:
-                of3_data[case_n][s] = {}
-            
-            # Assumes 5 models, numbered 1-5
-            for i in range(1,6):
-                model_path = f'{cr}/{s}/{case_n}_{s}_sample_{i}_model.cif'
-                #print(model_path, os.path.exists(model_path))
-                if os.path.exists(model_path):
-                    model_ligs = glob.glob(f'{cr}/{s}/{case_n}_{s}_sample_{i}_*LIG*lig.sdf')
-                    of3_data[case_n][s][i] = {'cif': model_path, 'sdfs': model_ligs}
-
-    return of3_data
 
 # Align each model to see if the proteins structure is ok
 # Check if the predicted ligands overlap with the fragment ensemble
 # If both are true, then the model can be advanced to MCS calculation
-def check_frag_alignment(of3_seed_data, frag_ensemble, ref_rec_pdb, max_rmsd=3.0, tmpdir='tmp/'):
+def check_frag_alignment(m_cif, m_ligs, frag_ensemble, ref_rec_pdb, max_rmsd=3.0, tmpdir='tmp/'):
     valid_models = []
     invalid_models = []
     err_log = []
@@ -248,38 +221,39 @@ def check_frag_alignment(of3_seed_data, frag_ensemble, ref_rec_pdb, max_rmsd=3.0
 
     cmd.remove('elem H') # No H in references
 
-    for model in of3_seed_data:
-        m_cif = of3_seed_data[model]['cif']
-        m_ligs = of3_seed_data[model]['sdfs']
+    #for model in of3_seed_data:
+    #    m_cif = of3_seed_data[model]['cif']
+    #    m_ligs = of3_seed_data[model]['sdfs']
         
-        cmd.load(m_cif, 'mdl_rec')
-        rmsd = cmd.align('mdl_rec', 'ref_rec')
-        rmsd = rmsd[0]
-        
-        #print(rmsd, max_rmsd)
-        if rmsd > max_rmsd: 
-            #print(f'\tFAILED Alignment for Model {model} (RMSD = {rmsd})')
-            err_log.append(f'\tCONF_FAIL Alignment for Model {model} (RMSD = {rmsd})')
-            cmd.delete('mdl_rec')
-            continue
-        
-        #print(m_ligs)
-        # Check if the ligand(s) superimpose
-        for i, lig in enumerate(m_ligs):
-            cmd.load(lig, f'mdl_lig-{i}')
-            cmd.matrix_copy('mdl_rec', f'mdl_lig-{i}') # Transpose the ligand
+    cmd.load(m_cif, 'mdl_rec')
+    rmsd = cmd.align('mdl_rec', 'ref_rec')
+    rmsd = rmsd[0]
+    
+    #print(rmsd, max_rmsd)
+    if rmsd > max_rmsd: 
+        print(f'\tFAILED Alignment for Model {m_cif} (RMSD = {rmsd})')
+        err_log.append(f'\tCONF_FAIL Alignment for Model {m_cif} (RMSD = {rmsd})')
+        cmd.delete('mdl_rec')
+        return valid_models, invalid_models, err_log
+    
+    #print(m_ligs)
+    # Check if the ligand(s) superimpose
+    for i, lig in enumerate(m_ligs):
+        cmd.load(lig, f'mdl_lig-{i}')
+        cmd.matrix_copy('mdl_rec', f'mdl_lig-{i}') # Transpose the ligand
 
-            n_ov = cmd.count_atoms(f'mdl_lig-{i} within 1.0 of frag_ensemble')
+        n_ov = cmd.count_atoms(f'mdl_lig-{i} within 1.0 of frag_ensemble')
 
-            lig_n = os.path.basename(lig)
-            out_sdf = f'{tmpdir}/{lig_n}'
-            if n_ov > 0:
-                cmd.save(out_sdf, f'mdl_lig-{i}')
-                valid_models.append(out_sdf)
-            else:
-                invalid_models.append(out_sdf)
-        
-        cmd.delete('mdl_*')
+        lig_n = os.path.basename(lig)
+        out_sdf = f'{tmpdir}/{lig_n}'
+        #print(out_sdf, n_ov)
+        if n_ov > 0:
+            cmd.save(out_sdf, f'mdl_lig-{i}')
+            valid_models.append(out_sdf)
+        else:
+            invalid_models.append(out_sdf)
+    
+    cmd.delete('mdl_*')
 
     return valid_models, invalid_models, err_log
 
@@ -391,15 +365,126 @@ def get_color_overlap(frag_pharm_coord_data, aligned_mols, overlap_dist=1.0):
 
     return mol_score_data
 
-def main():
-    os.makedirs(args.outdir, exist_ok=True)
+# Store structure information for models generated with OF3
+def read_of3_structures(of3_dir):
+    of3_data = {}
+    
+    of3_dir = os.path.abspath(of3_dir)
+    case_results = glob.glob(f'{of3_dir}/*/')
 
-    # Collect fragments as baseline ligands
-    #if args.fragment_list != None:
-    #    frag_paths = get_frag_paths(args.fragment_list)
-    #    _, frag_mols = collect_frag_structures(frag_paths)
+    for cr in case_results: 
+        case_n = cr.split('/')[-2]
+        #print(case_n, cr)
 
-    #if args.fragment_sdf != None:
+        if case_n not in of3_data:
+            of3_data[case_n] = {}
+
+        seeds = os.listdir(f'{cr}/')
+
+        for s in seeds:
+            if s not in of3_data[case_n]:
+                of3_data[case_n][s] = {}
+            
+            # Assumes 5 models, numbered 1-5
+            for i in range(1,6):
+                model_path = f'{cr}/{s}/{case_n}_{s}_sample_{i}_model.cif'
+                #print(model_path, os.path.exists(model_path))
+                if os.path.exists(model_path):
+                    model_ligs = glob.glob(f'{cr}/{s}/{case_n}_{s}_sample_{i}_*LIG*lig.sdf')
+                    of3_data[case_n][s][i] = {'cif': model_path, 'sdfs': model_ligs}
+
+    return of3_data
+
+def extract_sdfs_from_cif(cif_file, out_path, fragalysis_dir=None):
+
+    m_name = os.path.basename(cif_file).strip('.cif') # Remove .cif ext
+    case = m_name.split('_')[0]
+    cmd.reinitialize()
+    cmd.load(cif_file)
+
+    stored.lig_data = []
+    cmd.iterate('hetatm', 'stored.lig_data.append("_".join([resn.split("_")[0], resi, chain]))')
+    lig_data = list(set(stored.lig_data))
+
+    lig_sdf_l = []
+    for info in lig_data:
+        lign, ligi, lc = info.split('_')
+
+        if os.path.exists(f'{out_path}/{m_name}_{lc}-lig.sdf'):
+            os.remove(f'{out_path}/{m_name}_{lc}-lig.sdf')
+        
+        lig_sdf = f'{out_path}/{m_name}_{lign}-{ligi}-{lc}-lig.sdf'
+        cmd.save(lig_sdf, f'chain {lc}')
+
+
+        # Check if there are any "aromatic" bond types in the molecule
+        # If so, replace them with the kekulized form. (OST will fail otherwise)
+        # Try to kekulize with fragalysis ligand first
+        # Otherwise, try RDKit keulize
+        mol = Chem.MolFromMolFile(lig_sdf)
+        is_aromatic = False
+
+        try:
+            for bond in mol.GetBonds():
+                if bond.GetIsAromatic():
+                    is_aromatic = True
+                    break
+        except:
+            pass
+
+        if (is_aromatic) or (mol is None):
+            if fragalysis_dir != None:
+                # Try to assign bond orders from a fragalysis ligand template
+                ref_lig = f'{fragalysis_dir}/{case}/{case}_ligand.sdf'
+                ref_mol = Chem.MolFromMolFile(ref_lig)
+                ref_smi = Chem.MolToSmiles(ref_mol, kekuleSmiles=True)
+                template = AllChem.MolFromSmiles(ref_smi)
+        
+                cmd.save(f'{out_path}/tmp_lig.pdb', f'chain {lc}')
+                docked_pdb = Chem.MolFromPDBFile(f'{out_path}/tmp_lig.pdb')
+                try:
+                    new_mol = AllChem.AssignBondOrdersFromTemplate(template, docked_pdb)
+                except:
+                    print(f'\tERR_AssignBondOrders failed: {lig_sdf}')
+                    new_mol == None
+
+                os.remove(f'{result_dir}/tmp_lig.pdb')
+            
+                if new_mol is not None:
+                    print(f'\tAssigned bond order from template {ref_lig}')
+                    print(f'\t\tSuccessfully fixed {lig_sdf}')
+                    Chem.MolToMolFile(new_mol, lig_sdf)
+                else:
+                    # Try RDKit kekulize as a last resort 
+                    Chem.Kekulize(mol, clearAromaticFlags=True)
+                    #print('\tKekulize:', lig_sdf, mol) #Debug
+                    Chem.MolToMolFile(mol, lig_sdf)
+            else:
+                # Try RDKit kekulize as a last resort, or if no fragalysis
+                # directory is provided
+                Chem.Kekulize(mol, clearAromaticFlags=True)
+                #print('\tKekulize:', lig_sdf, mol) #Debug
+                Chem.MolToMolFile(mol, lig_sdf)
+
+        lig_sdf_l.append(lig_sdf)
+
+
+        #
+
+    return lig_sdf_l
+
+
+
+#def main():
+def mp_func(mp_inp):
+    #(case, fragment_ensemble, frag_mols, frag_pharm_pos_data
+    case_name = mp_inp[0]
+    fragment_ensemble = mp_inp[1]
+    frag_pharm_pos_data = mp_inp[2]
+    
+    #for m in frag_mols:
+    #    print(m)
+    #    print('\t', m.GetProp('_Name'))
 
     # Read fragment data
     suppl = Chem.SDMolSupplier(args.fragment_sdf)
@@ -408,6 +493,79 @@ def main():
         if m is not None:
             frag_mols.append(m)
     
+    all_mcs_cov_data = {}
+    err_out = []
+    all_out_data = []
+    #for case in tqdm.tqdm(os.listdir(args.of3_results_dir)):
+    for case in [case_name]:
+        if (os.path.isdir(f'{args.of3_results_dir}/{case}') == False)  or (case == 'logs'):
+            continue
+        
+        if case not in all_mcs_cov_data:
+            all_mcs_cov_data[case] = {}
+
+        for seed in os.listdir(f'{args.of3_results_dir}/{case}'):
+            #print('\t', seed)
+            for sample in range(1,6):
+                model_path = f'{args.of3_results_dir}/{case}/{seed}/{case}_{seed}_sample_{sample}_model.cif'
+                if os.path.exists(model_path):
+                    #print(f'\t{model_path}')
+                    model_ligs = extract_sdfs_from_cif(model_path, args.tmpdir, fragalysis_dir=None)
+                    aligned_models, invalid_models, errs = check_frag_alignment(model_path, model_ligs, fragment_ensemble, args.ref_rec, tmpdir=args.tmpdir)
+                    if len(errs) > 0:
+                        for l in errs:
+                            l += f' ({case} {seed})'
+                            err_out.append(l)
+
+                    # Load and annotate aligned ligands models
+                    aligned_mols = []
+                    for msdf in aligned_models:
+                        m_mol = Chem.MolFromMolFile(msdf)
+                        mol_smi = Chem.MolToSmiles(m_mol)
+                        m_mol.SetProp('path', msdf)
+                        m_mol.SetProp('_Name', f'{case}.{seed}.{sample}')
+                        m_mol.SetProp('smi', mol_smi)
+                        aligned_mols.append(m_mol)
+
+                    # Calculate color feature overlaps
+                    color_score_data = get_color_overlap(frag_pharm_pos_data, aligned_mols)
+
+                    # Calculate MCS RMSD metrics for each aligned cofolded molecule
+                    mcs_cov_data, out_data = get_mcs_cov(frag_mols, aligned_mols)
+
+                    # Append color features to the output
+                    outlines = []
+                    for l in out_data:
+                        m_name = l.split('\t')[0]
+                        
+                        l += f'\t{color_score_data[m_name]["total"]}'
+
+                        outlines.append(l)
+                    
+                    all_mcs_cov_data[case][seed] = mcs_cov_data
+
+
+                    #all_out_data += out_data
+                    all_out_data += outlines
+                    
+                    # Deleteligand sdf files
+                    for msdf in model_ligs:
+                        os.remove(msdf)
+                        
+    return all_out_data, all_mcs_cov_data, err_out
+
+def main():
+    os.makedirs(args.outdir, exist_ok=True)
+
+    suppl = Chem.SDMolSupplier(args.fragment_sdf)
+    frag_mols = []
+    for m in suppl:
+        if m is not None:
+            frag_mols.append(m)
+    
+    # Get pharmacophore atom data for fragment ensemble
+    frag_pharm_pos_data = detect_pharmacophore_atoms(frag_mols)
+
     # Save a fragment ensemble mol file
     fragment_ensemble = f'{args.tmpdir}/fragment_ensemble.mol'
     if os.path.exists(fragment_ensemble) == False:
@@ -418,84 +576,35 @@ def main():
         cmd.save(fragment_ensemble)
     
 
-    # Compile OF3 predictions and ligand mols
-    of3_struct_data = read_of3_structures(args.of3_results_dir)
-    
-    frag_pharm_pos_data = detect_pharmacophore_atoms(frag_mols)
-    #print(frag_pharm_data)
+    mp_inps = []
+    for case in os.listdir(args.of3_results_dir):
+        mp_inps.append((case, fragment_ensemble, frag_pharm_pos_data))
 
-    n_cases = 3 # Debug
-    n_case = 0 # Debug
-    all_mcs_cov_data = {}
-    err_out = []
     all_out_data = [f'mol_name\tlow_rmsd_mcs_coverage\tn_low_rmsd_mcs_atoms\tmol_size\tcolor_overlap']
-    for case in tqdm.tqdm(of3_struct_data):
-        #if n_case > n_cases: # Debug
-        #    with open('tsv_frag_coverage.tsv', 'w') as fo: # Debug
-        #        fo.write('\n'.join(all_out_data)) # Debug
-        #    with open(f'json_frag_coverage_info.json', 'w') as fo: # Debug
-        #        json.dump(all_mcs_cov_data, fo, indent=4) # Debug
-        #    return # Debug
-        #n_case += 1 # Debug
+    all_mcs_cov_data = {}
+    err_out_all = []
+    with mp.Pool(int(args.cpu_count)) as pool:
+        #r = list(tqdm.tqdm(pool.imap(mp_func, case_l, chunksize=1)))
+        combined_results = pool.map(mp_func, mp_inps, chunksize=1)
+        
+        #print(combined_results[0][1])
+        #print(combined_results[1][1])
+        #print(combined_results[0][1])
+        #print(combined_results[0][2])
+        #print(len(combined_results[0][1]), len(combined_results[1][1]))
+        
+    for i in range(len(combined_results)):
+        all_out_data += combined_results[i][0]
+        all_mcs_cov_data.update(combined_results[i][1])
+        err_out_all += combined_results[i][2]
+        
+        #print(out_data)
+        #print(f'Out Data: {len(out_data)}')
 
-        if case not in all_mcs_cov_data:
-            all_mcs_cov_data[case] = {}
-
-        for seed in of3_struct_data[case]:
-            aligned_models = glob.glob(f'{args.tmpdir}/{case}_{seed}*.sdf') # In case you rerun it/things crash
-            if len(aligned_models) == 0:
-                aligned_models, invalid_models, errs = check_frag_alignment(of3_struct_data[case][seed], fragment_ensemble, args.ref_rec, tmpdir=args.tmpdir)
-                
-                if len(errs) > 0:
-                    for l in errs:
-                        l += f' ({case} {seed})'
-                        err_out.append(l)
-
-                # Depreciated code to align to parent fragalysis file
-                #ref_rec = f'{args.fragalysis_dir}/{case}/{case}.pdb'
-                #aligned_models, invalid_models = check_frag_alignment(of3_struct_data[case][seed], fragment_ensemble, ref_rec, tmpdir=args.tmpdir)
-                #print(case, seed, len(aligned_models), len(invalid_models))
-            
-            # Calculate MCS RMSDs for valid models
-            aligned_mols = []
-            for sdf in aligned_models:
-                sample = os.path.basename(sdf).split(f'_{seed}_sample_')[1][0]
-                #print(sdf, sample)
-                mol = Chem.MolFromMolFile(sdf)
-                if mol is not None:
-                    mol_smi = Chem.MolToSmiles(mol)
-                    mol.SetProp('path', sdf)
-                    mol.SetProp('_Name', f'{case}.{seed}.{sample}')
-                    mol.SetProp('smi', mol_smi)
-                    aligned_mols.append(mol)
-                    
-                    #print('\t', sdf)
-                    #sucos, color_score, shape_score = calc_sucos(sdf, args.frag_ensemble, write=False, return_all=True)
-
-                    #print('\t', case, seed, sucos, color_score, shape_score)
-            
-            # Calculate color feature overlaps
-            color_score_data = get_color_overlap(frag_pharm_pos_data, aligned_mols)
-
-            # Calculate MCS RMSD metrics for each aligned cofolded molecule
-            mcs_cov_data, out_data = get_mcs_cov(frag_mols, aligned_mols)
-
-            # Append color features to the output
-            outlines = []
-            for l in out_data:
-                m_name = l.split('\t')[0]
-                
-                l += f'\t{color_score_data[m_name]["total"]}'
-
-                outlines.append(l)
-
-
-            all_mcs_cov_data[case][seed] = mcs_cov_data
-
-
-            #all_out_data += out_data
-            all_out_data += outlines
-
+        #all_out_data += out_data
+        #err_out_all += err_out
+        #all_mcs_cov_data.update(mcs_cov_data)
+    
     with open(f'{args.outdir}/tsv_frag_coverage.tsv', 'w') as fo:
         fo.write('\n'.join(all_out_data))
     
@@ -503,11 +612,10 @@ def main():
         json.dump(all_mcs_cov_data, fo, indent=4)
     
     with open(f'{args.outdir}/error_log.err', 'w') as fo:
-        fo.write('\n'.join(err_out))
+        fo.write('\n'.join(err_out_all))
 
-    # Delete the aligned OF3 ligand files
-    #os.rmdir(args.tmpdir)
     shutil.rmtree(args.tmpdir)
+
 
 if __name__=='__main__':
     main()
