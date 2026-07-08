@@ -22,9 +22,9 @@ from rdkit.Chem import rdFMCS, ChemicalFeatures
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--ref_rec', '-r', help='Path to a reference .pdb file for a fragment screening hits. All OF3 predictions will be aligned to this structure')
+parser.add_argument('--ref_rec', '-r', help='Path to a reference .pdb file for a fragment screening hits. All OF3 predictions will be aligned to this structure.')
 parser.add_argument('--fragment_sdf', '-fsdf', help='Path to an sdf with the subset of fragment structures to use for mcs_cov calculations. NOTE: all structures should be prealigned to --ref_rec.', default=None, required=True)
-parser.add_argument('--of3_results_dir', '-of3_r', help='Path to the directory containing OF3 predictions. NOTE: OF3 predictions should have ligands converted to .sdf format')
+parser.add_argument('--of3_results_dir', '-of3_r', help='Path to the directory containing OF3 predictions.')
 parser.add_argument('--outdir', '-o', help='Path to directory to store mcs_scoring_outputs (default = mcs-rmsd_score/', default='mcs-rmsd_score/')
 parser.add_argument('--tmpdir', '-tmp', help='Path to directory to store temporary files (default = tmpmols/', default='tmpmols/')
 parser.add_argument('--cpu_count', '-cpu', help='(Optional) Specify how many CPUs to use for parallelization. Default = None', default=None)
@@ -481,10 +481,6 @@ def mp_func(mp_inp):
     case_name = mp_inp[0]
     fragment_ensemble = mp_inp[1]
     frag_pharm_pos_data = mp_inp[2]
-    
-    #for m in frag_mols:
-    #    print(m)
-    #    print('\t', m.GetProp('_Name'))
 
     # Read fragment data
     suppl = Chem.SDMolSupplier(args.fragment_sdf)
@@ -496,10 +492,7 @@ def mp_func(mp_inp):
     all_mcs_cov_data = {}
     err_out = []
     all_out_data = []
-    #for case in tqdm.tqdm(os.listdir(args.of3_results_dir)):
     for case in [case_name]:
-        if (os.path.isdir(f'{args.of3_results_dir}/{case}') == False)  or (case == 'logs'):
-            continue
         
         if case not in all_mcs_cov_data:
             all_mcs_cov_data[case] = {}
@@ -578,14 +571,28 @@ def main():
 
     mp_inps = []
     for case in os.listdir(args.of3_results_dir):
+        if (os.path.isdir(f'{args.of3_results_dir}/{case}') == False)  or (case == 'logs'):
+            continue
+
         mp_inps.append((case, fragment_ensemble, frag_pharm_pos_data))
 
     all_out_data = [f'mol_name\tlow_rmsd_mcs_coverage\tn_low_rmsd_mcs_atoms\tmol_size\tcolor_overlap']
     all_mcs_cov_data = {}
     err_out_all = []
-    with mp.Pool(int(args.cpu_count)) as pool:
-        #r = list(tqdm.tqdm(pool.imap(mp_func, case_l, chunksize=1)))
-        combined_results = pool.map(mp_func, mp_inps, chunksize=1)
+
+    
+    # Quick multiprocessing implementation
+    print(f'Get MCS for {len(mp_inps)} inputs')
+    if args.cpu_count == None:
+        with mp.Pool(mp.cpu_count()) as pool:
+            combined_results = list(tqdm.tqdm(pool.imap(mp_func, mp_inps, chunksize=1)))
+    else:
+        with mp.Pool(int(args.cpu_count)) as pool: 
+            combined_results = list(tqdm.tqdm(pool.imap(mp_func, mp_inps, chunksize=1)))
+
+    #with mp.Pool(int(args.cpu_count)) as pool:
+    #    #r = list(tqdm.tqdm(pool.imap(mp_func, case_l, chunksize=1)))
+    #    combined_results = pool.map(mp_func, mp_inps, chunksize=1)
         
         #print(combined_results[0][1])
         #print(combined_results[1][1])
